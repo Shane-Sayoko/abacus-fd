@@ -10,6 +10,7 @@ from .core import (
     run_diff_custom_lr,
     run_diff_custom_kslr,
     run_single_kslr,
+    run_vibration,
 )
 
 logging.basicConfig(
@@ -91,6 +92,16 @@ COMMAND_DOCS = {
             "--dx": "Displacement distance in Angstrom (default: 0.001)",
         },
     },
+    "vib": {
+        "description": "Compute vibration frequencies and normal modes using finite difference of analytical forces",
+        "args": {
+            "dir": "Working directory containing STRU and INPUT files",
+            "abacus": "Path to the ABACUS executable",
+            "--dx": "Displacement distance in Angstrom (default: 0.001)",
+            "--nproc": "Number of MPI processes per task (default: 1)",
+            "--nparallel": "Number of concurrent tasks (default: 1)",
+        },
+    },
 }
 
 
@@ -108,6 +119,9 @@ def main():
         p.add_argument("-x", "--dx", type=float, default=0.001, help="Displacement distance")
         p.add_argument("-n", "--nproc", type=int, default=1, help="MPI ranks per task")
         p.add_argument("-j", "--nparallel", type=int, default=1, help="Concurrent tasks")
+        # Add cleanup flag
+        p.add_argument("--cleanup", dest="cleanup", action="store_true", default=True, help="Clean up temporary files (default)")
+        p.add_argument("--no-cleanup", dest="cleanup", action="store_false", help="Keep temporary files")
 
     p = subparsers.add_parser("gs-all", help=COMMAND_DOCS["gs-all"]["description"])
     add_common_args(p)
@@ -130,6 +144,8 @@ def main():
     p.add_argument("-i", "--indices", required=True, help="Comma-separated atom indices (0-based)")
     p.add_argument("--axes", required=True, help="Comma-separated axes (x,y,z)")
     p.add_argument("-x", "--dx", type=float, default=0.001, help="Displacement distance")
+    p.add_argument("--cleanup", dest="cleanup", action="store_true", default=True, help="Clean up temporary files")
+    p.add_argument("--no-cleanup", dest="cleanup", action="store_false", help="Keep temporary files")
 
     p = subparsers.add_parser("lr-custom", help=COMMAND_DOCS["lr-custom"]["description"])
     p.add_argument("-d", dest="dir", nargs="?", help="Working directory")
@@ -138,6 +154,8 @@ def main():
     p.add_argument("--axes", required=True, help="Comma-separated axes (x,y,z)")
     p.add_argument("-x", "--dx", type=float, default=0.001, help="Displacement distance")
     p.add_argument("-s", "--skip-gs", action="store_true", help="Skip ground state calculation")
+    p.add_argument("--cleanup", dest="cleanup", action="store_true", default=True, help="Clean up temporary files")
+    p.add_argument("--no-cleanup", dest="cleanup", action="store_false", help="Keep temporary files")
 
     p = subparsers.add_parser("kslr-custom", help=COMMAND_DOCS["kslr-custom"]["description"])
     p.add_argument("-d", dest="dir", nargs="?", help="Working directory")
@@ -145,6 +163,11 @@ def main():
     p.add_argument("-i", "--indices", required=True, help="Comma-separated atom indices (0-based)")
     p.add_argument("--axes", required=True, help="Comma-separated axes (x,y,z)")
     p.add_argument("-x", "--dx", type=float, default=0.001, help="Displacement distance")
+    p.add_argument("--cleanup", dest="cleanup", action="store_true", default=True, help="Clean up temporary files")
+    p.add_argument("--no-cleanup", dest="cleanup", action="store_false", help="Keep temporary files")
+
+    p = subparsers.add_parser("vib", help=COMMAND_DOCS["vib"]["description"])
+    add_common_args(p)
 
     args = parser.parse_args()
 
@@ -154,20 +177,20 @@ def main():
 
     if args.command == "gs-all":
         forces = run_diff_all_groundstate(
-            dir=args.dir, abacus_path=args.abacus, dx=args.dx, nproc=args.nproc, nparallel=args.nparallel
+            dir=args.dir, abacus_path=args.abacus, dx=args.dx, nproc=args.nproc, nparallel=args.nparallel, cleanup=args.cleanup
         )
         logger.info("Forces (eV/Angstrom):\n%s", forces)
 
     elif args.command == "lr-all":
         forces = run_diff_all_lr(
             dir=args.dir, abacus_path=args.abacus, dx=args.dx, skip_groundstate=args.skip_gs,
-            nproc=args.nproc, nparallel=args.nparallel
+            nproc=args.nproc, nparallel=args.nparallel, cleanup=args.cleanup
         )
         logger.info("Excited state forces:\n%s", forces)
 
     elif args.command == "kslr-all":
         forces = run_diff_all_kslr(
-            dir=args.dir, abacus_path=args.abacus, dx=args.dx, nproc=args.nproc, nparallel=args.nparallel
+            dir=args.dir, abacus_path=args.abacus, dx=args.dx, nproc=args.nproc, nparallel=args.nparallel, cleanup=args.cleanup
         )
         logger.info("Excited state forces:\n%s", forces)
 
@@ -178,7 +201,7 @@ def main():
         indices = [int(x.strip()) for x in args.indices.split(",")]
         axes = [x.strip() for x in args.axes.split(",")]
         forces = run_diff_custom_groundstate(
-            args.dir, args.abacus, diffed_atom_indices=indices, axes=axes, dx=args.dx
+            args.dir, args.abacus, diffed_atom_indices=indices, axes=axes, dx=args.dx, cleanup=args.cleanup
         )
         logger.info("Forces (eV/Angstrom):\n%s", forces)
 
@@ -186,7 +209,7 @@ def main():
         indices = [int(x.strip()) for x in args.indices.split(",")]
         axes = [x.strip() for x in args.axes.split(",")]
         forces = run_diff_custom_lr(
-            args.dir, args.abacus, diffed_atom_indices=indices, axes=axes, dx=args.dx, skip_groundstate=args.skip_gs
+            args.dir, args.abacus, diffed_atom_indices=indices, axes=axes, dx=args.dx, skip_groundstate=args.skip_gs, cleanup=args.cleanup
         )
         logger.info("Excited state forces:\n%s", forces)
 
@@ -194,9 +217,14 @@ def main():
         indices = [int(x.strip()) for x in args.indices.split(",")]
         axes = [x.strip() for x in args.axes.split(",")]
         forces = run_diff_custom_kslr(
-            args.dir, args.abacus, diffed_atom_indices=indices, axes=axes, dx=args.dx
+            args.dir, args.abacus, diffed_atom_indices=indices, axes=axes, dx=args.dx, cleanup=args.cleanup
         )
         logger.info("Excited state forces:\n%s", forces)
+
+    elif args.command == "vib":
+        run_vibration(
+            dir=args.dir, abacus_path=args.abacus, dx=args.dx, nproc=args.nproc, nparallel=args.nparallel, cleanup=args.cleanup
+        )
 
 
 if __name__ == "__main__":

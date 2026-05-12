@@ -1,12 +1,21 @@
 import concurrent.futures
 import subprocess
+import shutil
 from ase.io import read, write
 from ase.io.formats import UnknownFileTypeError
+from scipy import constants
 import numpy as np
 import os
 import logging
 
 logger = logging.getLogger(__name__)
+
+# Constants for frequency conversion
+C_SI = constants.c  # m/s
+AMU_SI = constants.atomic_mass  # kg
+EV_SI = constants.eV  # J
+ANGSTROM_SI = 1e-10  # m
+H_BAR_SI = constants.hbar # J*s
 
 
 def _read_abacus(path):
@@ -81,7 +90,7 @@ def modify_input_calculation(input_file, target_calc="scf"):
         if param_name not in handled_params:
             new_lines.insert(1, f"{param_name.ljust(15)} {value}\n")
         
-    with open(input_file, 'h' if False else 'w') as f: # Use 'w'
+    with open(input_file, 'w') as f:
         f.writelines(new_lines)
 
 
@@ -168,25 +177,17 @@ def grep_forces_from_log(log, natom):
         
     for i in range(len(lines) - 1, -1, -1):
         if "TOTAL-FORCE (eV/Angstrom)" in lines[i]:
-            # ABACUS LCAO Force Table format:
-            # i  : #TOTAL-FORCE (eV/Angstrom)#
-            # i+1: -------------------------------------------------------------------------
-            # i+2:     Atoms              Force_x              Force_y              Force_z 
-            # i+3: -------------------------------------------------------------------------
-            # i+4:       Li1         1.2496801433         0.0000000000         0.0000000000 
             start_data = i + 4
             for j in range(natom):
                 if start_data + j < len(lines):
                     parts = lines[start_data + j].split()
                     if len(parts) >= 4:
                         try:
-                            # parts[0] is AtomLabel, parts[1:4] are fx, fy, fz
                             forces[j] = [float(parts[1]), float(parts[2]), float(parts[3])]
                         except ValueError: continue
             found = True
             break
         elif "!FORCE_IS" in lines[i]:
-            # Handle PW or other formats if needed
             found = True
             break
             
@@ -225,13 +226,19 @@ def run_abacus(dir, abacus, nproc=1, log="log.txt"):
     absdir = os.path.abspath(dir)
     executable = os.path.abspath(abacus)
     
-    # Aggressively clean environment to prevent MPI deadlocks
     env = os.environ.copy()
-    mpi_prefixes = ["OMPI_", "PMIX_", "PMI_", "HYDRA_", "MPI_", "I_MPI_", "MV2_", "UCX_", "OPAL_"]
+    # 增加 SLURM_ 前缀以清理 Slurm 环境变量，解除父进程的 CPU 绑定继承
+    mpi_prefixes = ["OMPI_", "PMIX_", "PMI_", "HYDRA_", "MPI_", "I_MPI_", "MV2_", "UCX_", "OPAL_", "SLURM_"]
     for k in list(env.keys()):
         if any(k.startswith(prefix) for prefix in mpi_prefixes) or k == "LD_PRELOAD":
             env.pop(k, None)
             
+    env["I_MPI_HYDRA_BOOTSTRAP"] = "fork"
+    env["I_MPI_PIN"] = "off"
+    env["I_MPI_JOB_RES_CHECK_OFF"] = "yes"
+    
+    # 彻底禁用 OpenMP 和 MKL 的内部绑定，解除 CPU 争用
+    env["KMP_AFFINITY"] = "disabled"
     env["OMP_NUM_THREADS"] = "1"
     env["MKL_NUM_THREADS"] = "1"
     env["MKL_SERIAL"] = "YES"
@@ -257,16 +264,13 @@ def run_single_kslr(dir=".", abacus_path="abacus", nproc=1):
     if not os.path.exists(src_input):
         raise FileNotFoundError(f"INPUT file not found in {dir}")
 
-    # Get natom from STRU for force parsing later
     atoms = _read_abacus(src_stru)
     natom = len(atoms)
 
-    # Ensure output parameters are set for FSSH read-back
     modify_input_calculation(src_input, "scf")
     with open(src_input, "r") as f:
         lines = f.readlines()
     
-    # Ensure cal_force 1 is set to get analytical ground state forces
     extra_params = {
         "out_wfc_lcao": "1",
         "out_wfc_lr": "True",
@@ -297,7 +301,6 @@ def run_single_kslr(dir=".", abacus_path="abacus", nproc=1):
     logger.info(f"Running single ABACUS point in {dir} with nproc={nproc}...")
     run_abacus(dir, abacus_path, nproc=nproc, log="ks-lr.log")
     
-    # [Hijack-Force] Extract and save forces from multiple log locations
     suffix = grep_parameter_from_input(src_input, "suffix") or "ABACUS"
     possible_logs = [
         os.path.join(dir, f"OUT.{suffix}", "running_scf.log"),
@@ -382,14 +385,13 @@ def _run_task_kslr_worker(task_info):
     return task_name
 
 
-def run_diff_all_kslr(dir=".", abacus_path="abacus", dx=0.001, nproc=1, nparallel=1, calculation="scf"):
+def run_diff_all_kslr(dir=".", abacus_path="abacus", dx=0.001, nproc=1, nparallel=1, calculation="scf", cleanup=True):
     """Compute forces using task-level parallelism."""
     dir = os.path.abspath(dir)
     src_stru = os.path.join(dir, "STRU")
     src_input = os.path.join(dir, "INPUT")
     src_kpt = os.path.join(dir, "KPT") if os.path.exists(os.path.join(dir, "KPT")) else None
 
-    # Prepare all STRU files
     prepare_diff_all(src_stru=src_stru, dx=dx, output_dir=os.path.join(dir, "moved_STRU"), central=True)
     
     atoms = _read_abacus(src_stru)
@@ -416,7 +418,6 @@ def run_diff_all_kslr(dir=".", abacus_path="abacus", dx=0.001, nproc=1, nparalle
             })
 
     logger.info(f"Submitting {len(tasks)} tasks with nparallel={nparallel} (nproc per task={nproc})...")
-    logger.warning("Resource Reminder: Ensure Total Cores >= nparallel * nproc to avoid oversubscription.")
     
     if nparallel > 1:
         with concurrent.futures.ProcessPoolExecutor(max_workers=nparallel) as executor:
@@ -433,7 +434,6 @@ def run_diff_all_kslr(dir=".", abacus_path="abacus", dx=0.001, nproc=1, nparalle
             logger.info(f"Running ABACUS for {t['task_name']}...")
             _run_task_kslr_worker(t)
 
-    # Collect results
     suffix = grep_parameter_from_input(src_input, "suffix") or "ABACUS"
     lr_nstates_str = grep_parameter_from_input(src_input, "lr_nstates")
     nstates = int(lr_nstates_str) if lr_nstates_str else 1
@@ -451,6 +451,9 @@ def run_diff_all_kslr(dir=".", abacus_path="abacus", dx=0.001, nproc=1, nparalle
         with open(os.path.join(dir, "ground_forces.txt"), "w") as f:
             for i in range(natoms):
                 f.write(f"{i}  {ground_state_forces[i,0]:.6f}  {ground_state_forces[i,1]:.6f}  {ground_state_forces[i,2]:.6f}\n")
+        if cleanup:
+            shutil.rmtree(points_dir, ignore_errors=True)
+            shutil.rmtree(os.path.join(dir, "moved_STRU"), ignore_errors=True)
         return ground_state_forces
 
     excited_state_forces = np.zeros((natoms, 3, 2, nstates))
@@ -476,27 +479,24 @@ def run_diff_all_kslr(dir=".", abacus_path="abacus", dx=0.001, nproc=1, nparalle
                     fx, fy, fz = excited_state_forces[st, istate, iatom]
                     f.write(f"{st_labels[st]}  {istate}  {iatom}  {fx:.6f}  {fy:.6f}  {fz:.6f}\n")
     
+    if cleanup:
+        shutil.rmtree(points_dir, ignore_errors=True)
+        shutil.rmtree(os.path.join(dir, "moved_STRU"), ignore_errors=True)
     return excited_state_forces
 
-def run_diff_all_groundstate(dir=".", abacus_path="abacus", dx=0.001, nproc=1, nparallel=1):
-    return run_diff_all_kslr(dir, abacus_path, dx, nproc, nparallel, calculation="scf")
 
-def run_diff_all_lr(dir=".", abacus_path="abacus", dx=0.001, skip_groundstate=False, nproc=1, nparallel=1):
-    return run_diff_all_kslr(dir, abacus_path, dx, nproc, nparallel, calculation="scf")
+def run_diff_all_groundstate(dir=".", abacus_path="abacus", dx=0.001, nproc=1, nparallel=1, cleanup=True):
+    return run_diff_all_kslr(dir, abacus_path, dx, nproc, nparallel, calculation="scf", cleanup=cleanup)
+
+
+def run_diff_all_lr(dir=".", abacus_path="abacus", dx=0.001, skip_groundstate=False, nproc=1, nparallel=1, cleanup=True):
+    return run_diff_all_kslr(dir, abacus_path, dx, nproc, nparallel, calculation="scf", cleanup=cleanup)
+
 
 def prepare_diff_custom(
     src_stru, diffed_atom_indices, axes, dx, output_dir="moved_STRU", central=True
 ):
-    """Prepare finite difference STRU files for custom atoms and axes.
-
-    Args:
-        src_stru: Path to the source STRU file
-        diffed_atom_indices: List of atom indices to displace
-        axes: List of axes ('x', 'y', 'z')
-        dx: Displacement distance in Angstrom
-        output_dir: Output directory for displaced STRU files
-        central: Use central difference (default True)
-    """
+    """Prepare finite difference STRU files for custom atoms and axes."""
     os.makedirs(output_dir, exist_ok=True)
     src_stru = os.path.abspath(src_stru)
     output_dir = os.path.abspath(output_dir)
@@ -523,29 +523,17 @@ def prepare_diff_custom(
                 dest = os.path.join(output_dir, f"STRU_{i}_{'-' + axis}")
                 move_an_atom_in_stru(src_stru, dest, i, dr)
 
+
 def run_diff_custom_groundstate(
-    dir=".", abacus_path="abacus", *, diffed_atom_indices, axes, dx=0.001
+    dir=".", abacus_path="abacus", *, diffed_atom_indices, axes, dx=0.001, cleanup=True
 ):
-    """Compute ground state forces for custom atoms using finite difference.
-
-    Args:
-        dir: Directory containing STRU, INPUT (and optionally KPT) files
-        abacus_path: Path to the ABACUS executable
-        diffed_atom_indices: List of atom indices (0-based) to displace
-        axes: List of axes to displace ('x', 'y', 'z')
-        dx: Displacement distance in Angstrom (default 0.001)
-
-    Returns:
-        forces: dict mapping atom index to axis to force array
-    """
+    """Compute ground state forces for custom atoms using finite difference."""
     dir = os.path.abspath(dir)
     assert os.path.exists(os.path.join(dir, "INPUT")), "INPUT file not found"
     assert os.path.exists(os.path.join(dir, "STRU")), "STRU file not found"
     src_stru = os.path.join(dir, "STRU")
     src_input = os.path.join(dir, "INPUT")
-    src_kpt = None
-    if os.path.exists(os.path.join(dir, "KPT")):
-        src_kpt = os.path.join(dir, "KPT")
+    src_kpt = os.path.join(dir, "KPT") if os.path.exists(os.path.join(dir, "KPT")) else None
 
     prepare_diff_custom(
         src_stru,
@@ -572,9 +560,7 @@ def run_diff_custom_groundstate(
             logger.info(f"Running ABACUS SCF for atom {i} moved along {axis}...")
             run_abacus(task_dir, abacus_path, log="gs.log")
 
-    suffix = grep_parameter_from_input(src_input, "suffix")
-    if suffix is None or suffix == "":
-        suffix = "ABACUS"
+    suffix = grep_parameter_from_input(src_input, "suffix") or "ABACUS"
     forces = {}
     for i in diffed_atom_indices:
         forces[i] = {}
@@ -589,7 +575,11 @@ def run_diff_custom_groundstate(
                 energies.append(energy)
             force = np.array((energies[1] - energies[0])) / dx
             forces[i][axis] = force
+    if cleanup:
+        shutil.rmtree(points_dir, ignore_errors=True)
+        shutil.rmtree(os.path.join(dir, "moved_STRU"), ignore_errors=True)
     return forces
+
 
 def run_diff_custom_lr(
     dir=".",
@@ -599,62 +589,22 @@ def run_diff_custom_lr(
     axes,
     dx=0.001,
     skip_groundstate=False,
+    cleanup=True,
 ):
-    """Compute linear response TDDFT excited state forces for custom atoms.
-
-    Args:
-        dir: Directory containing STRU, INPUT_gs, INPUT_lr (and optionally KPT) files
-        abacus_path: Path to the ABACUS executable
-        diffed_atom_indices: List of atom indices (0-based) to displace
-        axes: List of axes to displace ('x', 'y', 'z')
-        dx: Displacement distance in Angstrom (default 0.001)
-        skip_groundstate: Skip ground state calculation if already done (default False)
-
-    Returns:
-        excited_state_forces: dict mapping atom index to axis to force array
-    """
+    """Compute linear response TDDFT excited state forces for custom atoms."""
     dir = os.path.abspath(dir)
-    assert os.path.exists(os.path.join(dir, "INPUT_lr")), "INPUT_lr file not found"
-    assert os.path.exists(os.path.join(dir, "STRU")), "STRU file not found"
-
-    src_stru = os.path.join(dir, "STRU")
     src_input_lr = os.path.join(dir, "INPUT_lr")
-    src_kpt = None
-    if os.path.exists(os.path.join(dir, "KPT")):
-        src_kpt = os.path.join(dir, "KPT")
-    atoms = _read_abacus(src_stru)
-    natoms = len(atoms)
+    src_stru = os.path.join(dir, "STRU")
+    src_kpt = os.path.join(dir, "KPT") if os.path.exists(os.path.join(dir, "KPT")) else None
+    
     points_dir = os.path.join(dir, "points")
     os.makedirs(points_dir, exist_ok=True)
 
-    suffix = grep_parameter_from_input(src_input_lr, "suffix")
-    if suffix is None or suffix == "":
-        suffix = "ABACUS"
-    nstates = int(grep_parameter_from_input(src_input_lr, "lr_nstates"))
-    if nstates is None:
-        nstates = 1
+    suffix = grep_parameter_from_input(src_input_lr, "suffix") or "ABACUS"
+    nstates = int(grep_parameter_from_input(src_input_lr, "lr_nstates") or 1)
 
-    ground_state_forces = {}
-    if skip_groundstate:
-        for i in diffed_atom_indices:
-            ground_state_forces[i] = {}
-            for axis in axes:
-                energies = []
-                for task_name in [f"STRU_{i}_{axis}", f"STRU_{i}_{'-' + axis}"]:
-                    task_dir = os.path.join(points_dir, task_name)
-                    task_scf_log = os.path.join(
-                        task_dir, f"OUT.{suffix}", "running_scf.log"
-                    )
-                    energy = grep_groundstate_energy_from_log(task_scf_log)
-                    energies.append(energy)
-                force = np.array((energies[1] - energies[0])) / dx
-                ground_state_forces[i][axis] = force
-    else:
-        os.system(f"cp {os.path.join(dir, 'INPUT_gs')} {os.path.join(dir, 'INPUT')}")
-        ground_state_forces = run_diff_custom_groundstate(
-            dir, abacus_path, diffed_atom_indices=diffed_atom_indices, axes=axes, dx=dx
-        )
-        os.system(f"rm {os.path.join(dir, 'INPUT')}")
+    if not skip_groundstate:
+        run_diff_custom_groundstate(dir, abacus_path, diffed_atom_indices=diffed_atom_indices, axes=axes, dx=dx, cleanup=False)
 
     for i in diffed_atom_indices:
         for axis in axes + ["-" + axis for axis in axes]:
@@ -671,9 +621,9 @@ def run_diff_custom_lr(
 
     excited_state_forces = {}
     for i in diffed_atom_indices:
+        excited_state_forces[i] = {}
         for axis in axes:
             energies = []
-            excited_state_forces[i] = {}
             for task_name in [f"STRU_{i}_{axis}", f"STRU_{i}_{'-' + axis}"]:
                 task_dir = os.path.join(points_dir, task_name)
                 energy = grep_excitation_energy_from_log(
@@ -681,49 +631,23 @@ def run_diff_custom_lr(
                 )
                 energies.append(energy)
             lr_force = (np.array(energies[1]) - np.array(energies[0])) / dx
-            logger.info(
-                f"LR forces for atom {i} along {axis} for each singlet state: {lr_force.reshape(2, -1)[0, :]} eV/Å"
-            )
-            logger.info(
-                f"LR forces for atom {i} along {axis} for each triplet state: {lr_force.reshape(2, -1)[1, :]} eV/Å"
-            )
-            excited_state_forces[i][axis] = lr_force + ground_state_forces[i][axis]
+            excited_state_forces[i][axis] = lr_force 
+    if cleanup:
+        shutil.rmtree(points_dir, ignore_errors=True)
+        shutil.rmtree(os.path.join(dir, "moved_STRU"), ignore_errors=True)
     return excited_state_forces
 
 
 def run_diff_custom_kslr(
-    dir=".", abacus_path="abacus", *, diffed_atom_indices, axes, dx=0.001
+    dir=".", abacus_path="abacus", *, diffed_atom_indices, axes, dx=0.001, cleanup=True
 ):
-    """Compute excited state forces using Kohn-Sham linear response for custom atoms.
-
-    Args:
-        dir: Directory containing STRU, INPUT (with lr_nstates) (and optionally KPT) files
-        abacus_path: Path to the ABACUS executable
-        diffed_atom_indices: List of atom indices (0-based) to displace
-        axes: List of axes to displace ('x', 'y', 'z')
-        dx: Displacement distance in Angstrom (default 0.001)
-
-    Returns:
-        excited_state_forces: dict mapping atom index to axis to force array
-    """
+    """Compute excited state forces using Kohn-Sham linear response for custom atoms."""
     dir = os.path.abspath(dir)
-    assert os.path.exists(os.path.join(dir, "INPUT")), "INPUT file not found"
-    assert os.path.exists(os.path.join(dir, "STRU")), "STRU file not found"
     src_stru = os.path.join(dir, "STRU")
     src_input = os.path.join(dir, "INPUT")
-    src_kpt = None
-    if os.path.exists(os.path.join(dir, "KPT")):
-        src_kpt = os.path.join(dir, "KPT")
+    src_kpt = os.path.join(dir, "KPT") if os.path.exists(os.path.join(dir, "KPT")) else None
 
-    prepare_diff_custom(
-        src_stru,
-        diffed_atom_indices,
-        axes,
-        dx=dx,
-        output_dir=os.path.join(dir, "moved_STRU"),
-        central=True,
-    )
-
+    prepare_diff_custom(src_stru, diffed_atom_indices, axes, dx=dx, output_dir=os.path.join(dir, "moved_STRU"), central=True)
     points_dir = os.path.join(dir, "points")
     os.makedirs(points_dir, exist_ok=True)
 
@@ -740,49 +664,124 @@ def run_diff_custom_kslr(
             logger.info(f"Running ABACUS SCF for atom {i} moved along {axis}...")
             run_abacus(task_dir, abacus_path, log="ks-lr.log")
 
-    suffix = grep_parameter_from_input(src_input, "suffix")
-    if suffix is None or suffix == "":
-        suffix = "ABACUS"
-    nstates = int(grep_parameter_from_input(src_input, "lr_nstates"))
-    if nstates is None:
-        nstates = 1
-    ground_state_forces = {}
-    for i in diffed_atom_indices:
-        ground_state_forces[i] = {}
-        for axis in axes:
-            energies = []
-            for task_name in [f"STRU_{i}_{axis}", f"STRU_{i}_{'-' + axis}"]:
-                task_dir = os.path.join(points_dir, task_name)
-                task_scf_log = os.path.join(
-                    task_dir, f"OUT.{suffix}", "running_scf.log"
-                )
-                energy = grep_groundstate_energy_from_log(task_scf_log)
-                energies.append(energy)
-            force = np.array((energies[1] - energies[0])) / dx
-            ground_state_forces[i][axis] = force
-    logger.info(
-        "Ground state forces (from finite difference) for each atom: \n",
-        ground_state_forces,
-    )
-
+    suffix = grep_parameter_from_input(src_input, "suffix") or "ABACUS"
+    nstates = int(grep_parameter_from_input(src_input, "lr_nstates") or 1)
     excited_state_forces = {}
     for i in diffed_atom_indices:
+        excited_state_forces[i] = {}
         for axis in axes:
             energies = []
-            excited_state_forces[i] = {}
             for task_name in [f"STRU_{i}_{axis}", f"STRU_{i}_{'-' + axis}"]:
                 task_dir = os.path.join(points_dir, task_name)
-                energy = grep_excitation_energy_from_log(
-                    os.path.join(task_dir, f"OUT.{suffix}", "running_scf.log"), nstates
-                )
+                energy = grep_excitation_energy_from_log(os.path.join(task_dir, f"OUT.{suffix}", "running_scf.log"), nstates)
                 energies.append(energy)
-            lr_force = (np.array(energies[1]) - np.array(energies[0])) / dx
-            logger.info(
-                f"LR forces for atom {i} along {axis} for each singlet state: {lr_force.reshape(2, -1)[0, :]} eV/Å"
-            )
-            logger.info(
-                f"LR forces for atom {i} along {axis} for each triplet state: {lr_force.reshape(2, -1)[1, :]} eV/Å"
-            )
-            excited_state_forces[i][axis] = lr_force + ground_state_forces[i][axis]
+            excited_state_forces[i][axis] = (np.array(energies[1]) - np.array(energies[0])) / dx
+    if cleanup:
+        shutil.rmtree(points_dir, ignore_errors=True)
+        shutil.rmtree(os.path.join(dir, "moved_STRU"), ignore_errors=True)
     return excited_state_forces
 
+
+def run_vibration(dir=".", abacus_path="abacus", dx=0.001, nproc=1, nparallel=1, cleanup=True):
+    """Perform numerical vibration analysis by calculating the Hessian matrix."""
+    dir = os.path.abspath(dir)
+    src_stru = os.path.join(dir, "STRU")
+    src_input = os.path.join(dir, "INPUT")
+    src_kpt = os.path.join(dir, "KPT") if os.path.exists(os.path.join(dir, "KPT")) else None
+
+    points_dir = os.path.join(dir, "points_vib")
+    os.makedirs(points_dir, exist_ok=True)
+    prepare_diff_all(src_stru=src_stru, dx=dx, output_dir=os.path.join(dir, "moved_STRU_vib"), central=True)
+    
+    atoms = _read_abacus(src_stru)
+    natoms = len(atoms)
+    masses = atoms.get_masses()
+    
+    tasks = []
+    for i in range(natoms):
+        for axis in ["x", "y", "z", "-x", "-y", "-z"]:
+            task_name = f"STRU_{i}_{axis}"
+            task_dir = os.path.join(points_dir, task_name)
+            task_stru_path = os.path.join(dir, "moved_STRU_vib", task_name)
+            tasks.append({
+                'task_name': task_name,
+                'task_dir': task_dir,
+                'abacus_path': abacus_path,
+                'nproc': nproc,
+                'log': "vib.log",
+                'src_input': src_input,
+                'task_stru_path': task_stru_path,
+                'src_kpt': src_kpt,
+                'calculation': 'scf'
+            })
+
+    logger.info(f"VIBRATION: Submitting {len(tasks)} tasks with nparallel={nparallel} (nproc per task={nproc})...")
+    
+    if nparallel > 1:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=nparallel) as executor:
+            futures = [executor.submit(_run_task_kslr_worker, t) for t in tasks]
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    name = future.result()
+                    logger.info(f"Finished vib task: {name}")
+                except Exception as exc:
+                    logger.error(f"Vib task generated an exception: {exc}")
+                    raise
+    else:
+        for t in tasks:
+            logger.info(f"Running vib ABACUS for {t['task_name']}...")
+            _run_task_kslr_worker(t)
+
+    suffix = grep_parameter_from_input(src_input, "suffix") or "ABACUS"
+    hessian = np.zeros((natoms * 3, natoms * 3))
+
+    for i in range(natoms):
+        f_plus = {}
+        f_minus = {}
+        for axis in ["x", "y", "z"]:
+            log_p = os.path.join(points_dir, f"STRU_{i}_{axis}", f"OUT.{suffix}", "running_scf.log")
+            log_m = os.path.join(points_dir, f"STRU_{i}_-{axis}", f"OUT.{suffix}", "running_scf.log")
+            f_plus[axis] = grep_forces_from_log(log_p, natoms)
+            f_minus[axis] = grep_forces_from_log(log_m, natoms)
+            
+            if f_plus[axis] is None or f_minus[axis] is None:
+                raise RuntimeError(f"Failed to parse forces for atom {i} axis {axis}")
+
+            alpha = {"x": 0, "y": 1, "z": 2}[axis]
+            row_idx = i * 3 + alpha
+            diff_f = f_plus[axis] - f_minus[axis]
+            grad_f = diff_f.flatten()
+            hessian[row_idx, :] = -grad_f / dx
+
+    hessian = (hessian + hessian.T) / 2.0
+    np.save(os.path.join(dir, "hessian.npy"), hessian)
+    m_vec = np.repeat(masses, 3)
+    m_inv_sqrt = 1.0 / np.sqrt(m_vec)
+    dyn_matrix = hessian * np.outer(m_inv_sqrt, m_inv_sqrt)
+    conv = (EV_SI / (ANGSTROM_SI**2)) / AMU_SI
+    dyn_matrix_si = dyn_matrix * conv
+    eigenvalues, eigenvectors = np.linalg.eigh(dyn_matrix_si)
+    
+    freqs_cm = []
+    for lam in eigenvalues:
+        if lam >= 0: freqs_cm.append(np.sqrt(lam) / (2.0 * np.pi * C_SI * 100.0))
+        else: freqs_cm.append(-np.sqrt(-lam) / (2.0 * np.pi * C_SI * 100.0))
+            
+    freqs_cm = np.array(freqs_cm)
+    log_path = os.path.join(dir, "vibration.log")
+    with open(log_path, "w") as f:
+        f.write("Numerical Vibration Analysis from abacus-fd\n")
+        f.write(f"Number of atoms: {natoms}\n")
+        f.write(f"Displacement dx: {dx} Angstrom\n\n")
+        for m in range(len(freqs_cm)):
+            f.write(f"Mode {m+1}: Frequency = {freqs_cm[m]:.6f} cm-1\n")
+            e = eigenvectors[:, m].reshape(natoms, 3)
+            for iatom in range(natoms):
+                f.write(f"{iatom+1}  {e[iatom, 0]:.10f}  {e[iatom, 1]:.10f}  {e[iatom, 2]:.10f}\n")
+            f.write("\n")
+
+    logger.info(f"Vibration analysis completed. Results saved to {log_path}")
+    if cleanup:
+        shutil.rmtree(points_dir, ignore_errors=True)
+        shutil.rmtree(os.path.join(dir, "moved_STRU_vib"), ignore_errors=True)
+    return freqs_cm, eigenvectors

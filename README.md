@@ -40,6 +40,7 @@ abacus-fd --help
 | `gs-custom` | Ground state forces | Specified | Specified |
 | `lr-all` | LR-TDDFT excited state forces | All atoms | x, y, z |
 | `lr-custom` | LR-TDDFT excited state forces | Specified | Specified |
+| `vib` | Vibration analysis (Harmonic frequencies) | All atoms | x, y, z |
 
 - `all`: Compute forces for all atoms, displacement directions are x, y, z
 - `custom`: Compute forces only for specified atoms and directions
@@ -57,6 +58,8 @@ abacus-fd --help
 | `-j` | `--nparallel` | Number of **concurrent tasks** | `1` |
 | `-i` | `--indices` | Atom indices (comma-separated) | - |
 | `-s` | `--skip-gs` | Skip ground state calculation | False |
+| | `--cleanup` | Delete temporary `points/` after extraction | True |
+| | `--no-cleanup` | Keep temporary folders for debugging | False |
 
 ## Parallelism and Resource Management
 
@@ -78,7 +81,7 @@ KSDFT + LR-TDDFT excited state forces for all atoms along x/y/z.
 
 **Usage:**
 ```bash
-abacus-fd kslr-all [-d DIR] [-a ABACUS] [-x DX] [-n NPROC] [-j NPARALLEL]
+abacus-fd kslr-all [-d DIR] [-a ABACUS] [-x DX] [-n NPROC] [-j NPARALLEL] [--no-cleanup]
 ```
 
 **Examples:**
@@ -117,7 +120,7 @@ KSDFT + LR-TDDFT excited state forces for specified atoms and directions.
 
 **Usage:**
 ```bash
-abacus-fd kslr-custom [-d DIR] [-a ABACUS] -i INDICES --axes AXES [-x DX] [-n NPROC] [-j NPARALLEL]
+abacus-fd kslr-custom [-d DIR] [-a ABACUS] -i INDICES --axes AXES [-x DX] [-n NPROC] [-j NPARALLEL] [--no-cleanup]
 ```
 
 ---
@@ -128,13 +131,28 @@ Ground state forces using task-parallelized finite difference.
 
 ---
 
+### vib
+
+Numerical vibration analysis (Harmonic frequencies and normal modes) using finite difference of analytical forces.
+
+**Usage:**
+```bash
+abacus-fd vib [-d DIR] [-a ABACUS] [-x DX] [-n NPROC] [-j NPARALLEL] [--no-cleanup]
+```
+
+**Output files:**
+- `vibration.log`: Harmonic frequencies (cm⁻¹) and normalized displacement vectors (standard ABACUS format).
+- `hessian.npy`: Raw Hessian matrix ($3N \times 3N$).
+
+---
+
 ## Notes
 
-- Central difference is used by default (splits displacement into +dx/2 and -dx/2)
-- `lr-*` commands require both `INPUT_gs` and `INPUT_lr` files
-- Output suffix defaults to "ABACUS" if not specified in INPUT files
-- Atom indices are 0-based (first atom is index 0)
-- Environment Isolation: `abacus-fd` aggressively cleans MPI-related environment variables before spawning tasks to prevent nested MPI deadlocks.
+- **Central Difference**: Used by default (splits displacement into +dx/2 and -dx/2).
+- **Automatic Cleanup**: By default, `abacus-fd` deletes massive temporary folders (`points/`, `moved_STRU/`) after extracting forces to prevent **"Disk quota exceeded"** errors in long FSSH runs. Use `--no-cleanup` if you need to inspect individual task logs.
+- **Environment Isolation**: `abacus-fd` aggressively cleans MPI-related environment variables (`SLURM_*`, `OMPI_*`, `PMIX_*`, `I_MPI_*`) and sets `KMP_AFFINITY=disabled` before spawning tasks. This prevents nested MPI deadlocks and resource contention, resolving performance lags in cluster environments.
+- **Requirements**: `lr-*` commands require both `INPUT_gs` and `INPUT_lr` files.
+- **Atom Indices**: 0-based (first atom is index 0).
 
 ## Testing
 
