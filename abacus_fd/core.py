@@ -6,6 +6,7 @@ from ase.io.formats import UnknownFileTypeError
 from scipy import constants
 import numpy as np
 import os
+import glob
 import logging
 
 logger = logging.getLogger(__name__)
@@ -169,29 +170,30 @@ def grep_forces_from_log(log, natom):
     """Pure Python implementation to grep analytical forces from abacus log file."""
     if not os.path.exists(log):
         return None
-    
-    forces = np.zeros((natom, 3))
-    found = False
+
     with open(log, "r") as f:
         lines = f.readlines()
-        
+
     for i in range(len(lines) - 1, -1, -1):
         if "TOTAL-FORCE (eV/Angstrom)" in lines[i]:
-            start_data = i + 4
-            for j in range(natom):
-                if start_data + j < len(lines):
-                    parts = lines[start_data + j].split()
-                    if len(parts) >= 4:
-                        try:
-                            forces[j] = [float(parts[1]), float(parts[2]), float(parts[3])]
-                        except ValueError: continue
-            found = True
-            break
-        elif "!FORCE_IS" in lines[i]:
-            found = True
-            break
-            
-    return forces if found else None
+            parsed_forces = []
+            for line in lines[i + 1:]:
+                if len(parsed_forces) == natom:
+                    break
+                stripped = line.strip()
+                if not stripped or stripped.startswith("-") or "Atoms" in stripped:
+                    continue
+                parts = stripped.split()
+                if len(parts) < 4:
+                    continue
+                try:
+                    parsed_forces.append([float(parts[-3]), float(parts[-2]), float(parts[-1])])
+                except ValueError:
+                    continue
+            if len(parsed_forces) == natom:
+                return np.array(parsed_forces)
+
+    return None
 
 
 def move_an_atom_in_stru(src, dest, atom_index, dr, scaled=False):
@@ -256,7 +258,7 @@ def run_abacus(dir, abacus, nproc=1, log="log.txt"):
         raise RuntimeError(f"ABACUS failed with status {e.returncode}.")
 
 
-def run_single_kslr(dir=".", abacus_path="abacus", nproc=1):
+def run_single_kslr(dir=".", abacus_path="abacus", nproc=1, cleanup=True):
     """Run a single SCF + LR-TDDFT calculation to get states and forces."""
     dir = os.path.abspath(dir)
     src_input = os.path.join(dir, "INPUT")
@@ -304,7 +306,8 @@ def run_single_kslr(dir=".", abacus_path="abacus", nproc=1):
     suffix = grep_parameter_from_input(src_input, "suffix") or "ABACUS"
     possible_logs = [
         os.path.join(dir, f"OUT.{suffix}", "running_scf.log"),
-        os.path.join(dir, "ks-lr.log")
+        *sorted(glob.glob(os.path.join(dir, f"OUT.{suffix}", "running_scf*.log")), reverse=True),
+        os.path.join(dir, "ks-lr.log"),
     ]
     
     forces = None
@@ -325,6 +328,18 @@ def run_single_kslr(dir=".", abacus_path="abacus", nproc=1):
                 
     if forces is None:
         logger.warning("Ground state forces could not be extracted from logs.")
+
+    if cleanup:
+        restart_dir = os.path.join(dir, "restart")
+        if os.path.isdir(restart_dir):
+            shutil.rmtree(restart_dir, ignore_errors=True)
+            logger.info(f"Cleaned up restart directory: {restart_dir}")
+        out_dir = os.path.join(dir, f"OUT.{suffix}")
+        for fname in (f"{suffix}-CHARGE-DENSITY.restart", f"{suffix}-TAU-DENSITY.restart"):
+            fpath = os.path.join(out_dir, fname)
+            if os.path.isfile(fpath):
+                os.remove(fpath)
+                logger.info(f"Cleaned up restart file: {fpath}")
 
     return True
 

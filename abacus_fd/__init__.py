@@ -137,6 +137,8 @@ def main():
     p.add_argument("-d", dest="dir", nargs="?", help="Working directory")
     p.add_argument("-a", "--abacus", default="abacus", help="Path to ABACUS binary")
     p.add_argument("-n", "--nproc", type=int, default=1, help="Number of MPI processes")
+    p.add_argument("--cleanup", dest="cleanup", action="store_true", default=True, help="Clean up restart files after calculation")
+    p.add_argument("--no-cleanup", dest="cleanup", action="store_false", help="Keep restart files")
 
     p = subparsers.add_parser("gs-custom", help=COMMAND_DOCS["gs-custom"]["description"])
     p.add_argument("-d", dest="dir", nargs="?", help="Working directory")
@@ -195,7 +197,7 @@ def main():
         logger.info("Excited state forces:\n%s", forces)
 
     elif args.command == "kslr-states":
-        run_single_kslr(dir=args.dir, abacus_path=args.abacus, nproc=args.nproc)
+        run_single_kslr(dir=args.dir, abacus_path=args.abacus, nproc=args.nproc, cleanup=args.cleanup)
 
     elif args.command == "gs-custom":
         indices = [int(x.strip()) for x in args.indices.split(",")]
