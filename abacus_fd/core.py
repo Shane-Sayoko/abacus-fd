@@ -1,12 +1,12 @@
 import concurrent.futures
 import subprocess
 import shutil
+import re
 from ase.io import read, write
 from ase.io.formats import UnknownFileTypeError
 from scipy import constants
 import numpy as np
 import os
-import glob
 import logging
 
 logger = logging.getLogger(__name__)
@@ -170,30 +170,29 @@ def grep_forces_from_log(log, natom):
     """Pure Python implementation to grep analytical forces from abacus log file."""
     if not os.path.exists(log):
         return None
-
+    
+    forces = np.zeros((natom, 3))
+    found = False
     with open(log, "r") as f:
         lines = f.readlines()
-
+        
     for i in range(len(lines) - 1, -1, -1):
         if "TOTAL-FORCE (eV/Angstrom)" in lines[i]:
-            parsed_forces = []
-            for line in lines[i + 1:]:
-                if len(parsed_forces) == natom:
-                    break
-                stripped = line.strip()
-                if not stripped or stripped.startswith("-") or "Atoms" in stripped:
-                    continue
-                parts = stripped.split()
-                if len(parts) < 4:
-                    continue
-                try:
-                    parsed_forces.append([float(parts[-3]), float(parts[-2]), float(parts[-1])])
-                except ValueError:
-                    continue
-            if len(parsed_forces) == natom:
-                return np.array(parsed_forces)
-
-    return None
+            start_data = i + 4
+            for j in range(natom):
+                if start_data + j < len(lines):
+                    parts = lines[start_data + j].split()
+                    if len(parts) >= 4:
+                        try:
+                            forces[j] = [float(parts[1]), float(parts[2]), float(parts[3])]
+                        except ValueError: continue
+            found = True
+            break
+        elif "!FORCE_IS" in lines[i]:
+            found = True
+            break
+            
+    return forces if found else None
 
 
 def move_an_atom_in_stru(src, dest, atom_index, dr, scaled=False):
@@ -229,7 +228,7 @@ def run_abacus(dir, abacus, nproc=1, log="log.txt"):
     executable = os.path.abspath(abacus)
     
     env = os.environ.copy()
-    # 增加 SLURM_ 前缀以清理 Slurm 环境变量，解除父进程的 CPU 绑定继承
+    # ���� SLURM_ ǰ׺������ Slurm ������������������̵� CPU �󶨼̳�
     mpi_prefixes = ["OMPI_", "PMIX_", "PMI_", "HYDRA_", "MPI_", "I_MPI_", "MV2_", "UCX_", "OPAL_", "SLURM_"]
     for k in list(env.keys()):
         if any(k.startswith(prefix) for prefix in mpi_prefixes) or k == "LD_PRELOAD":
@@ -239,7 +238,7 @@ def run_abacus(dir, abacus, nproc=1, log="log.txt"):
     env["I_MPI_PIN"] = "off"
     env["I_MPI_JOB_RES_CHECK_OFF"] = "yes"
     
-    # 彻底禁用 OpenMP 和 MKL 的内部绑定，解除 CPU 争用
+    # ���׽��� OpenMP �� MKL ���ڲ��󶨣���� CPU ����
     env["KMP_AFFINITY"] = "disabled"
     env["OMP_NUM_THREADS"] = "1"
     env["MKL_NUM_THREADS"] = "1"
@@ -306,8 +305,7 @@ def run_single_kslr(dir=".", abacus_path="abacus", nproc=1, cleanup=True):
     suffix = grep_parameter_from_input(src_input, "suffix") or "ABACUS"
     possible_logs = [
         os.path.join(dir, f"OUT.{suffix}", "running_scf.log"),
-        *sorted(glob.glob(os.path.join(dir, f"OUT.{suffix}", "running_scf*.log")), reverse=True),
-        os.path.join(dir, "ks-lr.log"),
+        os.path.join(dir, "ks-lr.log")
     ]
     
     forces = None
@@ -328,6 +326,25 @@ def run_single_kslr(dir=".", abacus_path="abacus", nproc=1, cleanup=True):
                 
     if forces is None:
         logger.warning("Ground state forces could not be extracted from logs.")
+
+    # Merge per-rank Casida amplitude files into single file for FSSH
+    out_dir = os.path.join(dir, f"OUT.{suffix}")
+    amp_pattern = re.compile(r"Excitation_Amplitude_singlet_\d+\.dat")
+    amp_files = []
+    if os.path.isdir(out_dir):
+        for fname in sorted(os.listdir(out_dir)):
+            if amp_pattern.match(fname):
+                amp_files.append(os.path.join(out_dir, fname))
+    if amp_files:
+        merged_path = os.path.join(out_dir, "Excitation_Amplitude_singlet.dat")
+        with open(merged_path, "w") as mf:
+            for fpath in amp_files:
+                with open(fpath) as sf:
+                    for line in sf:
+                        stripped = line.strip()
+                        if stripped:
+                            mf.write(stripped + "\n")
+        logger.info(f"Merged {len(amp_files)} Casida amplitude files -> {merged_path}")
 
     if cleanup:
         restart_dir = os.path.join(dir, "restart")
