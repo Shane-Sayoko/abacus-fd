@@ -68,6 +68,8 @@ def modify_input_calculation(input_file, target_calc="scf"):
     # Only force the calculation type. Preserve others like ks_solver, lr_solver.
     forced_params = {
         "calculation": target_calc,
+        "out_chg": "-1",
+        "restart_save": "0",
     }
     handled_params = set()
 
