@@ -8,6 +8,8 @@ from scipy import constants
 import numpy as np
 import os
 import logging
+import math
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +57,92 @@ def grep_parameter_from_input(input_file, para_name):
             if parts[0].lower() == para_name.lower() and len(parts) >= 2:
                 return parts[1]
     return None
+
+
+def copy_input_without_output_parameters(source_input, target_input):
+    """Copy an INPUT file while omitting unnecessary output-control parameters.
+
+    The finite-difference task INPUT files do not need the large ``cal_syns``
+    output or the ``cal_force`` output.  Keep the source INPUT unchanged so it
+    remains a faithful record of the user's calculation settings.
+
+    Args:
+        source_input: Path to the original INPUT file.
+        target_input: Path of the INPUT file written for a generated task.
+    """
+    omitted_parameters = {"cal_syns", "cal_force"}
+    with open(source_input, "r") as source, open(target_input, "w") as target:
+        for line in source:
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#"):
+                parameter_name = stripped.split(maxsplit=1)[0].lower()
+                if parameter_name in omitted_parameters:
+                    continue
+            target.write(line)
+
+
+def _parse_lr_dimensions(running_scf_log):
+    """Read the LR occupied and virtual dimensions written by ABACUS."""
+    with open(running_scf_log, "r") as handle:
+        content = handle.read()
+    nocc_match = re.search(r"number of occupied bands:\s*(\d+)", content)
+    nvirt_match = re.search(r"number of virtual bands:\s*(\d+)", content)
+    if nocc_match is None or nvirt_match is None:
+        raise RuntimeError("cannot determine LR occupied/virtual dimensions from running_scf.log")
+    return int(nocc_match.group(1)), int(nvirt_match.group(1))
+
+
+def merge_parallel_casida_amplitudes(output_dir, nproc, nstates, nocc, nvirt):
+    """Merge ABACUS rank-local Casida amplitudes into one portable X file.
+
+    ABACUS stores X as an ``nvirt x nocc`` ScaLAPACK matrix with block size
+    one.  This routine reproduces its row-major BLACS process-grid mapping and
+    writes ``Excitation_Amplitude_singlet.dat`` in the FSSH order
+    ``X[i_occ * nvirt + a_virt]``.  The result is independent of the MPI size
+    used by the finite-difference subprocess.
+    """
+    if nproc <= 0 or nstates <= 0 or nocc <= 0 or nvirt <= 0:
+        raise ValueError("nproc, nstates, nocc, and nvirt must all be positive")
+
+    nprow = int(math.sqrt(nproc + 0.5))
+    while nprow > 0 and nproc % nprow != 0:
+        nprow -= 1
+    if nprow == 0:
+        raise RuntimeError("cannot factor the ABACUS MPI process grid")
+    npcol = nproc // nprow
+
+    merged = np.zeros((nstates, nocc * nvirt), dtype=float)
+    covered = np.zeros(nocc * nvirt, dtype=bool)
+    for rank in range(nproc):
+        filename = os.path.join(output_dir, f"Excitation_Amplitude_singlet_{rank}.dat")
+        if not os.path.isfile(filename):
+            raise FileNotFoundError(f"missing Casida amplitude file: {filename}")
+        with open(filename, "r") as handle:
+            local = np.fromstring(handle.read(), sep=" ")
+        if local.size % nstates != 0:
+            raise RuntimeError(f"Casida amplitude file has incomplete state blocks: {filename}")
+
+        prow, pcol = divmod(rank, npcol)
+        rows = np.arange(prow, nvirt, nprow, dtype=int)
+        cols = np.arange(pcol, nocc, npcol, dtype=int)
+        local_size = rows.size * cols.size
+        if local.size != nstates * local_size:
+            raise RuntimeError(f"unexpected Casida amplitude block size in {filename}")
+        local = local.reshape(nstates, local_size)
+
+        for local_col, iocc in enumerate(cols):
+            indices = iocc * nvirt + rows
+            if np.any(covered[indices]):
+                raise RuntimeError("overlapping Casida amplitude ownership")
+            merged[:, indices] = local[:, local_col * rows.size:(local_col + 1) * rows.size]
+            covered[indices] = True
+
+    if not np.all(covered):
+        raise RuntimeError("incomplete Casida amplitude ownership")
+
+    merged_file = os.path.join(output_dir, "Excitation_Amplitude_singlet.dat")
+    np.savetxt(merged_file, merged, fmt="%.16e")
+    return merged_file
 
 
 def modify_input_calculation(input_file, target_calc="scf"):
@@ -303,11 +391,18 @@ def run_single_kslr(dir=".", abacus_path="abacus", nproc=1, cleanup=True):
 
     logger.info(f"Running single ABACUS point in {dir} with nproc={nproc}...")
     run_abacus(dir, abacus_path, nproc=nproc, log="ks-lr.log")
-    
+
     suffix = grep_parameter_from_input(src_input, "suffix") or "ABACUS"
+    out_dir = os.path.join(dir, f"OUT.{suffix}")
+    nstates = int(grep_parameter_from_input(src_input, "lr_nstates") or 1)
+    nocc, nvirt = _parse_lr_dimensions(os.path.join(out_dir, "running_scf.log"))
+    merged_amplitude = merge_parallel_casida_amplitudes(out_dir, nproc, nstates, nocc, nvirt)
+    logger.info("Merged rank-local Casida amplitudes into %s", merged_amplitude)
+
     possible_logs = [
-        os.path.join(dir, f"OUT.{suffix}", "running_scf.log"),
-        os.path.join(dir, "ks-lr.log")
+        os.path.join(out_dir, "running_scf.log"),
+        *sorted(glob.glob(os.path.join(out_dir, "running_scf*.log")), reverse=True),
+        os.path.join(dir, "ks-lr.log"),
     ]
     
     forces = None
@@ -353,7 +448,6 @@ def run_single_kslr(dir=".", abacus_path="abacus", nproc=1, cleanup=True):
         if os.path.isdir(restart_dir):
             shutil.rmtree(restart_dir, ignore_errors=True)
             logger.info(f"Cleaned up restart directory: {restart_dir}")
-        out_dir = os.path.join(dir, f"OUT.{suffix}")
         for fname in (f"{suffix}-CHARGE-DENSITY.restart", f"{suffix}-TAU-DENSITY.restart"):
             fpath = os.path.join(out_dir, fname)
             if os.path.isfile(fpath):
@@ -405,8 +499,7 @@ def _run_task_kslr_worker(task_info):
     
     os.makedirs(task_dir, exist_ok=True)
     target_input = os.path.join(task_dir, 'INPUT')
-    with open(src_input, "r") as fs, open(target_input, "w") as fd: 
-        fd.write(fs.read())
+    copy_input_without_output_parameters(src_input, target_input)
     modify_input_calculation(target_input, calculation)
     
     with open(task_stru_path, "r") as fs, open(os.path.join(task_dir, "STRU"), "w") as fd:
@@ -587,7 +680,7 @@ def run_diff_custom_groundstate(
             task_stru = os.path.join(dir, "moved_STRU", task_name)
             task_dir = os.path.join(points_dir, task_name)
             os.makedirs(task_dir, exist_ok=True)
-            os.system(f"cp {src_input} {os.path.join(task_dir, 'INPUT')}")
+            copy_input_without_output_parameters(src_input, os.path.join(task_dir, "INPUT"))
             os.system(f"cp {task_stru} {os.path.join(task_dir, 'STRU')}")
             if src_kpt is not None:
                 os.system(f"cp {src_kpt} {os.path.join(task_dir, 'KPT')}")
@@ -646,7 +739,7 @@ def run_diff_custom_lr(
             task_stru = os.path.join(dir, "moved_STRU", task_name)
             task_dir = os.path.join(points_dir, task_name)
             os.makedirs(task_dir, exist_ok=True)
-            os.system(f"cp {src_input_lr} {os.path.join(task_dir, 'INPUT')}")
+            copy_input_without_output_parameters(src_input_lr, os.path.join(task_dir, "INPUT"))
             os.system(f"cp {task_stru} {os.path.join(task_dir, 'STRU')}")
             if src_kpt is not None:
                 os.system(f"cp {src_kpt} {os.path.join(task_dir, 'KPT')}")
@@ -691,7 +784,7 @@ def run_diff_custom_kslr(
             task_stru = os.path.join(dir, "moved_STRU", task_name)
             task_dir = os.path.join(points_dir, task_name)
             os.makedirs(task_dir, exist_ok=True)
-            os.system(f"cp {src_input} {os.path.join(task_dir, 'INPUT')}")
+            copy_input_without_output_parameters(src_input, os.path.join(task_dir, "INPUT"))
             os.system(f"cp {task_stru} {os.path.join(task_dir, 'STRU')}")
             if src_kpt is not None:
                 os.system(f"cp {src_kpt} {os.path.join(task_dir, 'KPT')}")

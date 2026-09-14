@@ -109,8 +109,8 @@ abacus-fd kslr-states [-d DIR] [-a ABACUS] [-n NPROC]
 
 **Output:**
 - `wf_nao.txt`: LCAO wavefunctions.
-- `Excitation_Amplitude_singlet_*.dat`: Per-rank Casida X coefficient files.
-- `Excitation_Amplitude_singlet.dat`: Merged Casida X coefficients (auto-generated from per-rank files, consumed by FSSH).
+- `Excitation_Amplitude_singlet_*.dat`: rank-local Casida X coefficients emitted by ABACUS.
+- `Excitation_Amplitude_singlet.dat`: a portable, merged Casida X file. Rows are excitation states and columns follow `X[i_occ * nvirt + a_virt]`; this file is independent of the MPI size used by `kslr-states` and is intended for FSSH consumers.
 - `Excitation_Energy_singlet.dat`: Excitation energies.
 - `ground_forces.txt`: Ground state analytical forces.
 
