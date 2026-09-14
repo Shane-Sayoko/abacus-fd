@@ -32,6 +32,24 @@ class CasidaAmplitudeMergeTest(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 merge_parallel_casida_amplitudes(directory, 2, 2, 2, 18)
 
+    def test_removes_rank_files_only_after_a_successful_merge(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for rank in range(2):
+                np.savetxt(
+                    os.path.join(directory, f"Excitation_Amplitude_singlet_{rank}.dat"),
+                    np.full((1, 1), rank + 1.0),
+                )
+
+            merged = merge_parallel_casida_amplitudes(
+                directory, 2, 1, 2, 1, cleanup_rank_files=True
+            )
+
+            self.assertTrue(os.path.isfile(merged))
+            for rank in range(2):
+                self.assertFalse(
+                    os.path.exists(os.path.join(directory, f"Excitation_Amplitude_singlet_{rank}.dat"))
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

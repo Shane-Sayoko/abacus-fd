@@ -92,14 +92,16 @@ def _parse_lr_dimensions(running_scf_log):
     return int(nocc_match.group(1)), int(nvirt_match.group(1))
 
 
-def merge_parallel_casida_amplitudes(output_dir, nproc, nstates, nocc, nvirt):
+def merge_parallel_casida_amplitudes(output_dir, nproc, nstates, nocc, nvirt, cleanup_rank_files=False):
     """Merge ABACUS rank-local Casida amplitudes into one portable X file.
 
     ABACUS stores X as an ``nvirt x nocc`` ScaLAPACK matrix with block size
     one.  This routine reproduces its row-major BLACS process-grid mapping and
     writes ``Excitation_Amplitude_singlet.dat`` in the FSSH order
     ``X[i_occ * nvirt + a_virt]``.  The result is independent of the MPI size
-    used by the finite-difference subprocess.
+    used by the finite-difference subprocess. When ``cleanup_rank_files`` is
+    true, the rank-local input files are removed only after the merged file is
+    written successfully.
     """
     if nproc <= 0 or nstates <= 0 or nocc <= 0 or nvirt <= 0:
         raise ValueError("nproc, nstates, nocc, and nvirt must all be positive")
@@ -142,6 +144,9 @@ def merge_parallel_casida_amplitudes(output_dir, nproc, nstates, nocc, nvirt):
 
     merged_file = os.path.join(output_dir, "Excitation_Amplitude_singlet.dat")
     np.savetxt(merged_file, merged, fmt="%.16e")
+    if cleanup_rank_files:
+        for rank in range(nproc):
+            os.remove(os.path.join(output_dir, f"Excitation_Amplitude_singlet_{rank}.dat"))
     return merged_file
 
 
@@ -396,7 +401,9 @@ def run_single_kslr(dir=".", abacus_path="abacus", nproc=1, cleanup=True):
     out_dir = os.path.join(dir, f"OUT.{suffix}")
     nstates = int(grep_parameter_from_input(src_input, "lr_nstates") or 1)
     nocc, nvirt = _parse_lr_dimensions(os.path.join(out_dir, "running_scf.log"))
-    merged_amplitude = merge_parallel_casida_amplitudes(out_dir, nproc, nstates, nocc, nvirt)
+    merged_amplitude = merge_parallel_casida_amplitudes(
+        out_dir, nproc, nstates, nocc, nvirt, cleanup_rank_files=cleanup
+    )
     logger.info("Merged rank-local Casida amplitudes into %s", merged_amplitude)
 
     possible_logs = [
@@ -423,25 +430,6 @@ def run_single_kslr(dir=".", abacus_path="abacus", nproc=1, cleanup=True):
                 
     if forces is None:
         logger.warning("Ground state forces could not be extracted from logs.")
-
-    # Merge per-rank Casida amplitude files into single file for FSSH
-    out_dir = os.path.join(dir, f"OUT.{suffix}")
-    amp_pattern = re.compile(r"Excitation_Amplitude_singlet_\d+\.dat")
-    amp_files = []
-    if os.path.isdir(out_dir):
-        for fname in sorted(os.listdir(out_dir)):
-            if amp_pattern.match(fname):
-                amp_files.append(os.path.join(out_dir, fname))
-    if amp_files:
-        merged_path = os.path.join(out_dir, "Excitation_Amplitude_singlet.dat")
-        with open(merged_path, "w") as mf:
-            for fpath in amp_files:
-                with open(fpath) as sf:
-                    for line in sf:
-                        stripped = line.strip()
-                        if stripped:
-                            mf.write(stripped + "\n")
-        logger.info(f"Merged {len(amp_files)} Casida amplitude files -> {merged_path}")
 
     if cleanup:
         restart_dir = os.path.join(dir, "restart")
